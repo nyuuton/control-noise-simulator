@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import { AppState, ComponentConfig } from './types';
-import { simulateFrame } from './physics/engine';
+import { simulateFrame, SimulationResult } from './physics/engine';
 import Oscilloscope from './components/Oscilloscope';
 import Spectrum from './components/Spectrum';
 import ControlPanel from './components/ControlPanel';
@@ -12,10 +12,11 @@ import SourceVisualizer from './components/SourceVisualizer';
 const INITIAL_STATE: AppState = {
   source: {
     targetFreq: 6.2,
-    waveformShape: 'square', // Default to square to show ramps better
-    windowFunction: 'none',
+    envelopeType: 'rectangular',
     pulseWidth: 50,
-    riseTime: 5, // 5ns ramp
+    riseTime: 5,     // 5ns ramp
+    sigma: 10,       // Default sigma for Gaussian
+    libraryWindow: 'hanning'
   },
   awg: { 
     ncoFreq: 0.2, 
@@ -32,6 +33,8 @@ const INITIAL_STATE: AppState = {
   },
   cable_room: { 
     temp: 300, 
+    noiseType: 'thermal',
+    noiseIntensity: 1.0,
     components: [
       { id: 'att1', type: 'attenuator', value: 3 }, // Initial 3dB loss
     ] 
@@ -41,7 +44,7 @@ const INITIAL_STATE: AppState = {
     flickerNoise: 0.5,
     components: [
       { id: 'att2', type: 'attenuator', value: 20 }, // Initial 20dB loss
-      { id: 'lp1', type: 'lowpass', value: 0.8 },
+      { id: 'lp1', type: 'lowpass', value: 8.0 }, // 8 GHz Cutoff
     ]
   },
   qubit: { 
@@ -65,56 +68,83 @@ const App = () => {
   const [params, setParams] = useState<AppState>(INITIAL_STATE);
   const [isPlaying, setIsPlaying] = useState(true);
   const [animationSpeed, setAnimationSpeed] = useState(1.0);
-  const [estimatedT2, setEstimatedT2] = useState<number>(0);
   
-  // Real-time buffers
-  const [simData, setSimData] = useState<{
-    noisy: Float32Array, 
-    ideal: Float32Array,
-    maxAmp: number
-  } | null>(null);
-
-  // Animation Loop
+  // Throttle updates to React state for UI numbers
+  const [metrics, setMetrics] = useState({ t2: 0, power: -100, temp: 0 });
+  
+  // --- REFS FOR PHYSICS ENGINE ---
+  // These allow the loop to run without triggering React renders
+  const paramsRef = useRef(INITIAL_STATE);
+  const activeStageRef = useRef(activeStage);
   const timeRef = useRef(0);
+  const simResultRef = useRef<SimulationResult | null>(null);
 
-  // Main Simulation Loop
+  // Sync State to Refs
+  useEffect(() => {
+    paramsRef.current = params;
+  }, [params]);
+
+  useEffect(() => {
+    activeStageRef.current = activeStage;
+  }, [activeStage]);
+
+  // Main Simulation Loop (Runs via requestAnimationFrame)
   useEffect(() => {
     let animationFrameId: number;
+    let frameCount = 0;
 
-    const runSimulation = () => {
-      // Only advance time if playing
+    const loop = () => {
+      // Only advance time and calculate physics if playing
       if (isPlaying) {
+        // 1. Advance Physics Time
         timeRef.current += 5 * animationSpeed; 
+        
+        // 2. Run Physics Engine (Writes to SharedBuffer)
+        simResultRef.current = simulateFrame(
+            paramsRef.current, 
+            timeRef.current, 
+            activeStageRef.current
+        );
+
+        // 3. Update UI (Throttled)
+        // Only update React state for T2/Power every 10 frames to avoid DOM thrashing
+        if (frameCount++ % 10 === 0 && simResultRef.current) {
+           setMetrics({
+               t2: simResultRef.current.estimatedT2,
+               power: simResultRef.current.signalPowerdBm,
+               temp: simResultRef.current.effectiveNoiseTemp
+           });
+        }
       }
-      
-      const result = simulateFrame(params, timeRef.current, activeStage);
-      setSimData({
-        noisy: result.noisyBuffer,
-        ideal: result.idealBuffer,
-        maxAmp: result.maxAmplitude
-      });
-      
-      // Update T2 Estimate if qubit (decoupled from params to avoid infinite loops)
-      if (activeStage === 'qubit') {
-         setEstimatedT2(result.estimatedT2);
-      }
+
+      animationFrameId = requestAnimationFrame(loop);
     };
 
-    if (isPlaying) {
-      const loop = () => {
-        runSimulation();
-        animationFrameId = requestAnimationFrame(loop);
-      };
-      loop();
-    } else {
-      // If paused, run once to update view with new params/stage, then stop.
-      runSimulation();
-    }
+    loop();
 
     return () => {
-      if (animationFrameId) cancelAnimationFrame(animationFrameId);
+      cancelAnimationFrame(animationFrameId);
     };
-  }, [params, activeStage, isPlaying, animationSpeed]);
+  }, [isPlaying, animationSpeed]); 
+
+  // Secondary Effect: Update Simulation when Paused if Parameters Change
+  // This ensures the visualizer updates when dragging sliders even if time is stopped.
+  useEffect(() => {
+    if (!isPlaying) {
+      simResultRef.current = simulateFrame(
+          params, 
+          timeRef.current, 
+          activeStage
+      );
+      if (simResultRef.current) {
+           setMetrics({
+               t2: simResultRef.current.estimatedT2,
+               power: simResultRef.current.signalPowerdBm,
+               temp: simResultRef.current.effectiveNoiseTemp
+           });
+      }
+    }
+  }, [params, activeStage, isPlaying]);
 
   const updateParam = (section: keyof AppState, key: string, val: number | string | boolean) => {
     setParams(prev => ({
@@ -216,22 +246,15 @@ const App = () => {
         <div className="flex-1 p-6 flex flex-col pt-20 gap-4">
           {activeStage === 'source' ? (
              <SourceVisualizer params={params.source} />
-          ) : simData ? (
+          ) : (
             <>
-              <Oscilloscope 
-                data={simData.noisy} 
-                idealData={simData.ideal} 
-                maxAmp={simData.maxAmp} 
-              />
+              {/* Components now consume the REF, not state. No React re-renders for physics! */}
+              <Oscilloscope simRef={simResultRef} />
               <Spectrum 
-                data={simData.noisy} 
+                simRef={simResultRef} 
                 centerFreq={params.mixer.loFreq + params.awg.ncoFreq}
               />
             </>
-          ) : (
-            <div className="flex-1 flex items-center justify-center text-slate-600 font-mono animate-pulse">
-              Initializing Physics Engine...
-            </div>
           )}
         </div>
       </div>
@@ -240,7 +263,9 @@ const App = () => {
       <ControlPanel 
         activeStage={activeStage} 
         params={params}
-        estimatedT2={estimatedT2}
+        estimatedT2={metrics.t2} 
+        signalPowerdBm={metrics.power}
+        effectiveNoiseTemp={metrics.temp}
         animationSpeed={animationSpeed}
         setAnimationSpeed={setAnimationSpeed}
         onUpdate={updateParam}

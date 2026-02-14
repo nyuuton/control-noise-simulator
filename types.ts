@@ -3,16 +3,24 @@ export interface SimulationState {
   time: number;
 }
 
-export type WaveformShape = 'sine' | 'gaussian' | 'square';
-export type WindowFunction = 'none' | 'hanning' | 'hamming' | 'blackman';
+export type EnvelopeType = 'cw' | 'rectangular' | 'gaussian' | 'library';
+export type LibraryWindowType = 'hanning' | 'hamming' | 'blackman';
+export type NoiseType = 'thermal' | 'interference';
 
 export interface SourceParams {
   // Planning / Ideal Definition
   targetFreq: number; // GHz
-  waveformShape: WaveformShape;
+  
+  // Envelope Definition
+  envelopeType: EnvelopeType;
+  
+  // Common Params
   pulseWidth: number; // ns (Total Duration)
-  riseTime: number;   // ns (Ramp duration for Square/Trapezoid)
-  windowFunction: WindowFunction;
+  
+  // Type-Specific Params
+  riseTime: number;         // ns (For Rectangular: Ramp duration)
+  sigma: number;            // ns (For Gaussian: Standard Deviation)
+  libraryWindow: LibraryWindowType; // (For Library: Hanning, etc.)
 }
 
 export interface AWGParams {
@@ -46,6 +54,8 @@ export interface ComponentConfig {
 export interface CableParams {
   temp: number;        // Kelvin
   flickerNoise?: number; // 1/f magnitude (only for Cryo)
+  noiseType?: NoiseType; // For room temp: 'thermal' or 'interference'
+  noiseIntensity?: number; // Scalar multiplier for the noise
   components: ComponentConfig[];
 }
 
